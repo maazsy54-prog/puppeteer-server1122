@@ -1,0 +1,15 @@
+# Deploy to Render.com
+# 1. Push this folder to a GitHub repo
+# 2. Connect repo to Render
+# 3. Set environment variables: API_SECRET
+
+services:
+  - type: web
+    name: visa-slot-checker
+    env: docker
+    plan: starter # $7/month
+    envVars:
+      - key: API_SECRET
+        generateValue: true
+      - key: PORT
+        value: 3000
