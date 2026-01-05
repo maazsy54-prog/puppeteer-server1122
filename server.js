@@ -9,127 +9,240 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const API_SECRET = process.env.API_SECRET || 'change-this-secret';
 
-/* ================= AUTH ================= */
-function authenticate(req, res, next) {
+// Middleware to check API secret
+const authenticate = (req, res, next) => {
   const authHeader = req.headers.authorization;
-  if (authHeader !== `Bearer ${API_SECRET}`) {
+  if (!authHeader || authHeader !== `Bearer ${API_SECRET}`) {
     return res.status(401).json({ success: false, error: 'Unauthorized' });
   }
   next();
-}
+};
 
-/* ================= ROUTES ================= */
-app.get('/', (_, res) => res.json({ status: 'ok' }));
-app.get('/health', (_, res) => res.json({ status: 'ok', time: new Date() }));
+// Health check
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
 
-/* ================= MAIN ================= */
+// Main visa slot checker endpoint
 app.post('/check-slots', authenticate, async (req, res) => {
   const { username, password, appd } = req.body;
+
   if (!username || !password || !appd) {
-    return res.status(400).json({ success: false, error: 'Missing fields' });
+    return res.status(400).json({ 
+      success: false, 
+      error: 'Missing required fields: username, password, appd' 
+    });
   }
 
-  let browser;
-
+  let browser = null;
+  
   try {
+    console.log('Launching browser...');
     browser = await puppeteer.launch({
       headless: 'new',
-      executablePath: puppeteer.executablePath(),
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
-        '--disable-blink-features=AutomationControlled',
         '--disable-dev-shm-usage',
-        '--window-size=1920,1080'
+        '--disable-accelerated-2d-canvas',
+        '--disable-gpu',
+        '--window-size=1920x1080'
       ]
     });
 
     const page = await browser.newPage();
-    page.setDefaultTimeout(0);
-    page.setDefaultNavigationTimeout(0);
-
+    
+    // Set realistic viewport and user agent
     await page.setViewport({ width: 1920, height: 1080 });
-    await page.setUserAgent(
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36'
-    );
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
 
-    console.log('[INFO] Opening site...');
+    console.log('Navigating to login page...');
     await page.goto('https://www.usvisascheduling.com/en-US/login/', {
-      waitUntil: 'domcontentloaded'
+      waitUntil: 'networkidle2',
+      timeout: 60000
     });
 
-    /* ================= CLOUDFLARE WAIT ================= */
-    console.log('[INFO] Waiting for login form...');
-    await page.waitForFunction(() => {
-      const inputs = document.querySelectorAll('input');
-      return [...inputs].some(i =>
-        /email|user|login/i.test(i.placeholder || '') ||
-        /username/i.test(i.name || '')
-      );
-    });
+    // Wait for login form
+    await page.waitForSelector('input[name="username"], input[type="text"]', { timeout: 30000 });
+    
+    console.log('Filling login form...');
+    // Fill username
+    const usernameInput = await page.$('input[name="username"]') || await page.$('input[type="text"]');
+    await usernameInput.click({ clickCount: 3 });
+    await usernameInput.type(username, { delay: 50 });
 
-    /* ================= FIND INPUTS DYNAMICALLY ================= */
-    const inputs = await page.$$('input');
-    let userInput, passInput;
+    // Fill password
+    const passwordInput = await page.$('input[name="password"]') || await page.$('input[type="password"]');
+    await passwordInput.click({ clickCount: 3 });
+    await passwordInput.type(password, { delay: 50 });
 
-    for (const input of inputs) {
-      const type = await input.evaluate(el => el.type);
-      const name = await input.evaluate(el => el.name || '');
-      const placeholder = await input.evaluate(el => el.placeholder || '');
-
-      if (!userInput && /text|email/i.test(type)) userInput = input;
-      if (!passInput && /password/i.test(type)) passInput = input;
+    // Click login button
+    const loginButton = await page.$('button[type="submit"]') || await page.$('button:contains("Login")');
+    if (loginButton) {
+      await loginButton.click();
     }
 
-    if (!userInput || !passInput) {
-      return res.json({
-        success: false,
-        error: 'Login form blocked by CAPTCHA / Cloudflare'
-      });
-    }
+    // Wait for navigation after login
+    await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 60000 });
+    console.log('Logged in successfully');
 
-    await userInput.type(username, { delay: 50 });
-    await passInput.type(password, { delay: 50 });
+    // Navigate to the schedule page (not payment page)
+    const scheduleUrl = `https://www.usvisascheduling.com/en-US/schedule/?reschedule=true`;
+    console.log('Navigating to schedule page:', scheduleUrl);
+    await page.goto(scheduleUrl, { waitUntil: 'networkidle2', timeout: 60000 });
 
-    /* ================= LOGIN ================= */
-    await Promise.all([
-      page.keyboard.press('Enter'),
-      page.waitForNavigation({ waitUntil: 'domcontentloaded' })
-    ]);
+    // Wait a bit for the page to fully load
+    await new Promise(resolve => setTimeout(resolve, 3000));
 
-    console.log('[INFO] Logged in');
-
-    /* ================= API FETCH ================= */
-    const apiUrl =
-      `https://www.usvisascheduling.com/en-US/api/v1/schedule-group/get-family-consular-schedule-entries` +
-      `?appd=${appd}&cacheString=${Date.now()}`;
-
+    // Make the API call to get available days (correct endpoint from screenshot)
+    const cacheString = Date.now().toString();
+    const apiUrl = `https://www.usvisascheduling.com/en-US/api/v1/schedule-group/get-family-consular-schedule-days?appd=${appd}&cacheString=${cacheString}`;
+    
+    console.log('Fetching slot data from API:', apiUrl);
     const slotsData = await page.evaluate(async (url) => {
-      const res = await fetch(url, {
-        method: 'POST',
-        credentials: 'include',
-        headers: { 'Accept': 'application/json' }
-      });
-      return res.ok ? res.json() : { error: res.status };
+      try {
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+          },
+          credentials: 'include'
+        });
+        
+        if (!response.ok) {
+          const errorText = await response.text();
+          return { error: `HTTP ${response.status}`, status: response.status, message: errorText };
+        }
+        
+        return await response.json();
+      } catch (err) {
+        return { error: err.message };
+      }
     }, apiUrl);
 
+    console.log('API response received:', JSON.stringify(slotsData).substring(0, 500));
+
+    if (slotsData.error) {
+      // Check if it's a 404 "Application not found" type error
+      const statusCode = slotsData.status || 500;
+      return res.status(statusCode).json({
+        success: false,
+        error: slotsData.error,
+        message: slotsData.message || 'Failed to fetch slot data'
+      });
+    }
+
+    // Parse the slots data
+    const slots = parseSlots(slotsData);
+    
     return res.json({
       success: true,
-      data: slotsData,
+      slots,
+      totalSlots: slots.length,
       checkedAt: new Date().toISOString()
     });
 
-  } catch (err) {
-    console.error('[ERROR]', err.message);
-    return res.status(500).json({ success: false, error: err.message });
+  } catch (error) {
+    console.error('Error:', error.message);
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
   } finally {
-    if (browser) await browser.close();
+    if (browser) {
+      await browser.close();
+      console.log('Browser closed');
+    }
   }
 });
 
-/* ================= START ================= */
+// Parse slots from API response
+function parseSlots(data) {
+  const slots = [];
+  
+  try {
+    console.log('Parsing slots data:', JSON.stringify(data).substring(0, 500));
+    
+    // Handle the structure from get-family-consular-schedule-days endpoint
+    if (data && typeof data === 'object') {
+      // Check if it's an array of locations with days
+      if (Array.isArray(data)) {
+        data.forEach(location => {
+          const locationName = location.locationName || location.location || location.name || 'Unknown';
+          const consulate = location.consulateName || location.consulate || locationName;
+          
+          // Handle days array
+          if (location.days && Array.isArray(location.days)) {
+            location.days.forEach(day => {
+              slots.push({
+                location: locationName,
+                consulate,
+                date: day.date || day,
+                time: day.time || null,
+                available: true
+              });
+            });
+          }
+          
+          // Handle slots array
+          if (location.slots && Array.isArray(location.slots)) {
+            location.slots.forEach(slot => {
+              slots.push({
+                location: locationName,
+                consulate,
+                date: slot.date || slot.appointmentDate,
+                time: slot.time || slot.appointmentTime,
+                available: true
+              });
+            });
+          }
+          
+          // Handle availableDates array
+          if (location.availableDates && Array.isArray(location.availableDates)) {
+            location.availableDates.forEach(dateInfo => {
+              slots.push({
+                location: locationName,
+                consulate,
+                date: typeof dateInfo === 'string' ? dateInfo : dateInfo.date,
+                time: dateInfo.time || null,
+                available: true
+              });
+            });
+          }
+
+          // Handle direct date properties
+          if (location.date) {
+            slots.push({
+              location: locationName,
+              consulate,
+              date: location.date,
+              time: location.time || null,
+              available: true
+            });
+          }
+        });
+      }
+      
+      // Handle object with locations property
+      if (data.locations && Array.isArray(data.locations)) {
+        return parseSlots(data.locations);
+      }
+      
+      // Handle object with results property  
+      if (data.results && Array.isArray(data.results)) {
+        return parseSlots(data.results);
+      }
+    }
+  } catch (err) {
+    console.error('Error parsing slots:', err);
+  }
+  
+  console.log(`Parsed ${slots.length} slots`);
+  return slots;
+}
+
 app.listen(PORT, () => {
-  console.log(`✅ Server running on port ${PORT}`);
+  console.log(`Visa slot checker server running on port ${PORT}`);
 });
-
-
