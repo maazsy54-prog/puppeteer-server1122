@@ -60,62 +60,117 @@ app.post('/check-slots', authenticate, async (req, res) => {
     console.log('Navigating to login page...');
     await page.goto('https://www.usvisascheduling.com/en-US/login/', {
       waitUntil: 'networkidle2',
-      timeout: 60000
+      timeout: 90000,
     });
 
-    // Wait for login form
-    await page.waitForSelector('input[name="username"], input[type="text"]', { timeout: 30000 });
-    
-    console.log('Filling login form...');
-    // Fill username
-    const usernameInput = await page.$('input[name="username"]') || await page.$('input[type="text"]');
-    await usernameInput.click({ clickCount: 3 });
-    await usernameInput.type(username, { delay: 50 });
+    const landedUrl = page.url();
+    const landedTitle = await page.title().catch(() => '');
+    console.log('Landed URL:', landedUrl);
+    if (landedTitle) console.log('Landed title:', landedTitle);
 
-    // Fill password
-    const passwordInput = await page.$('input[name="password"]') || await page.$('input[type="password"]');
-    await passwordInput.click({ clickCount: 3 });
-    await passwordInput.type(password, { delay: 50 });
+    // Some regions redirect to a Microsoft B2C login domain or show a waiting room / bot challenge.
+    // Be a bit more patient and support common selectors across variants.
+    await new Promise((resolve) => setTimeout(resolve, 8000));
 
-    // Click login button
-    const loginButton = await page.$('button[type="submit"]') || await page.$('button:contains("Login")');
-    if (loginButton) {
-      await loginButton.click();
+    const usernameSelector = 'input#signInName, input[name="username"], input[name="Username"], input[type="email"], input[type="text"]';
+    const passwordSelector = 'input#password, input[name="password"], input[name="Password"], input[type="password"]';
+
+    console.log('Waiting for login form...');
+    try {
+      await page.waitForSelector(usernameSelector, { timeout: 60000 });
+    } catch (e) {
+      const html = await page.content().catch(() => '');
+      const looksLikeBotChallenge =
+        html.includes('cf-chl') ||
+        html.toLowerCase().includes('cloudflare') ||
+        html.toLowerCase().includes('attention required') ||
+        html.toLowerCase().includes('verify you are human');
+
+      console.error('Login form not found. URL:', page.url());
+      if (landedTitle) console.error('Title:', landedTitle);
+      console.error('Bot-challenge detected:', looksLikeBotChallenge);
+      console.error('HTML snippet:', html.substring(0, 800));
+
+      throw new Error(
+        looksLikeBotChallenge
+          ? 'Blocked by anti-bot/verification page. Open the URL in a normal browser from the same region to confirm.'
+          : `Login form selectors not found. The login page may have changed (URL: ${page.url()}).`
+      );
     }
 
-    // Wait for navigation after login
-    await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 60000 });
-    console.log('Logged in successfully');
+    console.log('Filling login form...');
+    // Fill username/email
+    const usernameInput =
+      (await page.$('input#signInName')) ||
+      (await page.$('input[name="username"]')) ||
+      (await page.$('input[name="Username"]')) ||
+      (await page.$('input[type="email"]')) ||
+      (await page.$('input[type="text"]'));
 
-    // Navigate to the schedule page (not payment page)
-    const scheduleUrl = `https://www.usvisascheduling.com/en-US/schedule/?reschedule=true`;
+    if (!usernameInput) throw new Error('Could not find username/email input on login page');
+    await usernameInput.click({ clickCount: 3 });
+    await usernameInput.type(username, { delay: 60 });
+
+    // Fill password
+    const passwordInput =
+      (await page.$('input#password')) ||
+      (await page.$('input[name="password"]')) ||
+      (await page.$('input[name="Password"]')) ||
+      (await page.$('input[type="password"]'));
+
+    if (!passwordInput) throw new Error('Could not find password input on login page');
+    await passwordInput.click({ clickCount: 3 });
+    await passwordInput.type(password, { delay: 60 });
+
+    // Click login/next button (note: CSS :contains() is not supported)
+    const loginButton =
+      (await page.$('button#next')) ||
+      (await page.$('button[type="submit"]')) ||
+      (await (async () => {
+        const [btn] = await page.$x(
+          "//button[contains(., 'Sign') or contains(., 'Login') or contains(., 'Next') or contains(., 'Continue')]"
+        );
+        return btn || null;
+      })());
+
+    if (!loginButton) throw new Error('Could not find login button on login page');
+
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 90000 }).catch(() => null),
+      loginButton.click(),
+    ]);
+
+    console.log('Login submitted');
+
+    // Navigate to the schedule page WITH appd context
+    // (the website typically includes appd in the schedule URL; without it the API can return "Application not found")
+    const scheduleUrl = `https://www.usvisascheduling.com/en-US/schedule/?appd=${encodeURIComponent(appd)}&reschedule=true`;
     console.log('Navigating to schedule page:', scheduleUrl);
     await page.goto(scheduleUrl, { waitUntil: 'networkidle2', timeout: 60000 });
 
     // Wait a bit for the page to fully load
     await new Promise(resolve => setTimeout(resolve, 3000));
 
-    // Make the API call to get available days (correct endpoint from screenshot)
+    // Call the API endpoint seen in the browser (use GET)
     const cacheString = Date.now().toString();
-    const apiUrl = `https://www.usvisascheduling.com/en-US/api/v1/schedule-group/get-family-consular-schedule-days?appd=${appd}&cacheString=${cacheString}`;
-    
+    const apiUrl = `https://www.usvisascheduling.com/en-US/api/v1/schedule-group/get-family-consular-schedule-days?appd=${encodeURIComponent(appd)}&cacheString=${cacheString}`;
+
     console.log('Fetching slot data from API:', apiUrl);
     const slotsData = await page.evaluate(async (url) => {
       try {
         const response = await fetch(url, {
-          method: 'POST',
+          method: 'GET',
           headers: {
-            'Content-Type': 'application/json',
             'Accept': 'application/json'
           },
           credentials: 'include'
         });
-        
+
         if (!response.ok) {
           const errorText = await response.text();
           return { error: `HTTP ${response.status}`, status: response.status, message: errorText };
         }
-        
+
         return await response.json();
       } catch (err) {
         return { error: err.message };
